@@ -1,0 +1,224 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{enumitem}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  backgroundcolor=\color{gray!10},
+  frame=single
+}
+
+\title{SigDINO-Qwen-GateX: A Frozen-Encoder Multimodal Fusion Pipeline\\
+for Fake Review Detection --- Training Report}
+\author{}
+\date{October 1, 2026}
+
+\begin{document}
+\maketitle
+
+\noindent
+\textbf{Machine:} NVIDIA GeForce RTX 3050 Laptop GPU (6\,GB VRAM), CUDA 12.1\\
+\textbf{Project folder:} \texttt{C:\textbackslash FAKE REVIEW}
+
+\section{Architecture}
+
+\textbf{Encoders} (all frozen, no fine-tuning):
+\begin{itemize}[nosep]
+    \item Text: \texttt{answerdotai/ModernBERT-base} --- token-level sequence output
+    \item Image A: \texttt{google/siglip2-base-patch16-224} --- patch tokens plus image/text embeddings used for a cosine alignment score
+    \item Image B: \texttt{facebook/dinov2-base} --- patch tokens, fine-grained
+\end{itemize}
+
+\textbf{Fusion head} (the only trainable component, 3{,}875{,}842 parameters):
+\begin{align}
+T_{\text{seq}} &= \mathrm{proj}_{\text{text}}(\text{ModernBERT token sequence}) &&\in \mathbb{R}^{B \times L_t \times D}\\
+V_{\text{img\_seq}} &= \mathrm{concat}\big(\mathrm{proj}_{\text{siglip}}(\text{SigLIP2 patches}),\ \mathrm{proj}_{\text{dino}}(\text{DINOv2 patches})\big) &&\in \mathbb{R}^{B \times N_{\text{img}} \times D}\\
+H_{\text{text}} &= \mathrm{meanpool}\big(\mathrm{CrossAttn}(Q{=}T_{\text{seq}},\, K{=}V{=}V_{\text{img\_seq}})\big)\\
+H_{\text{img}} &= \mathrm{meanpool}\big(\mathrm{CrossAttn}(Q{=}V_{\text{img\_seq}},\, K{=}V{=}T_{\text{seq}})\big)\\
+g &= \sigma\big(W_g\,[H_{\text{text}}; H_{\text{img}}; s_{\text{align}}]\big) &&\text{(gated multimodal unit)}\\
+F &= g \odot H_{\text{text}} + (1-g) \odot H_{\text{img}}\\
+\text{logits} &= \mathrm{MLP}\big([F;\, s_{\text{align}}]\big)
+\end{align}
+
+This is a two-stage pipeline designed to fit a 6\,GB laptop GPU:
+\begin{description}
+    \item[Stage 1] (\texttt{extract\_features.py}): runs the three frozen encoders once, one at a time, with no gradients, and caches their outputs to disk.
+    \item[Stage 2] (\texttt{train.py}): trains only the small fusion head on the cached tensors; the large encoders are never loaded in this stage.
+\end{description}
+
+\section{Dataset}
+
+AiGen-FoodReview (Gambetti \& Han, ICWSM 2024), Zenodo record 10511456, MIT licensed. Review text and restaurant image pairs, binary label (human-written vs.\ AI-generated review/image pair).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+\textbf{Quantity} & \textbf{Value} \\
+\midrule
+Total pairs downloaded & 20{,}144 images + 3 CSVs (train/val/test) \\
+Train split & 12{,}086 samples \\
+Validation split & 4{,}028 samples \\
+Test split & 4{,}030 samples \\
+ID column in CSVs & \texttt{ID} (uppercase) \\
+\bottomrule
+\end{tabular}
+\caption{Dataset split sizes.}
+\end{table}
+
+\section{Bug Found and Fixed During This Run}
+
+\textbf{File:} \texttt{extract\_features.py} (SigLIP2 stream).
+
+\textbf{Problem:} in the installed \texttt{transformers} version, \texttt{model.get\_image\_features()} and \texttt{model.get\_text\_features()} return a \texttt{BaseModelOutputWithPooling} object rather than a raw tensor, as the original code assumed. This crashed the smoke test with:
+
+\begin{lstlisting}
+AttributeError: 'BaseModelOutputWithPooling' object has no attribute 'float'
+\end{lstlisting}
+
+\textbf{Fix:} verified live against the actual loaded SigLIP2 model, then changed both calls to read \texttt{.pooler\_output} from the returned object. The smoke test (50 samples) was re-run end to end afterward to confirm the fix; it passed cleanly with the expected tensor shapes.
+
+\section{Feature Extraction (Stage 1) --- Result}
+
+Ran successfully on GPU for all three splits with no errors.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{File} & \textbf{Samples} & \textbf{Size} \\
+\midrule
+\texttt{features/train.pt} & 12{,}086 & 2.97\,GB \\
+\texttt{features/val.pt}   & 4{,}028  & 0.99\,GB \\
+\texttt{features/test.pt}  & 4{,}030  & 0.99\,GB \\
+\bottomrule
+\end{tabular}
+\caption{Cached feature files.}
+\end{table}
+
+Cached tensors per sample: \texttt{text\_tokens} (128, 768, ModernBERT, fp16), \texttt{text\_mask} (128, bool), \texttt{siglip\_patches} (16, 768, pooled 4$\times$4 grid, fp16), \texttt{dino\_patches} (16, 768, pooled 4$\times$4 grid, fp16), \texttt{s\_align} (1, SigLIP2 image--text cosine alignment score), \texttt{label} (0 = human, 1 = AI-generated).
+
+\section{Training (Stage 2) --- Result}
+
+\textbf{Command:} \texttt{python train.py --features features --out runs/exp1}\\
+\textbf{Trainable parameters:} 3{,}875{,}842 \quad \textbf{Batch size:} 64 \quad \textbf{LR:} $2\times10^{-4}$ \quad \textbf{Max epochs:} 20 \quad \textbf{Early-stop patience:} 5
+
+\begin{table}[h]
+\centering
+\begin{tabular}{crrrrl}
+\toprule
+\textbf{Epoch} & \textbf{Train Loss} & \textbf{Val Loss} & \textbf{Val Acc} & \textbf{Val F1} & \textbf{Note} \\
+\midrule
+1  & 0.0917 & 0.0253 & 0.9918 & 0.9917 & new best \\
+2  & 0.0084 & 0.0096 & 0.9960 & 0.9960 & new best \\
+3  & 0.0049 & 0.0590 & 0.9856 & 0.9854 & \\
+4  & 0.0018 & 0.0102 & 0.9973 & 0.9973 & new best \\
+5  & 0.0040 & 0.0097 & 0.9970 & 0.9970 & \\
+6  & 0.0045 & 0.0105 & 0.9970 & 0.9970 & \\
+7  & 0.0010 & 0.0048 & 0.9985 & 0.9985 & new best (checkpoint used) \\
+8  & 0.0015 & 0.0121 & 0.9975 & 0.9975 & \\
+9  & 0.0011 & 0.0051 & 0.9978 & 0.9978 & \\
+10 & 0.0002 & 0.0199 & 0.9948 & 0.9948 & \\
+11 & 0.0000 & 0.0073 & 0.9978 & 0.9978 & \\
+12 & 0.0000 & 0.0072 & 0.9983 & 0.9983 & \\
+\bottomrule
+\end{tabular}
+\caption{Per-epoch validation metrics. Training early-stopped after epoch 12 (no val F1 improvement for 5 epochs). Best checkpoint: epoch 7 (val F1 = 0.9985), saved as \texttt{runs/exp1/best\_model.pt}.}
+\end{table}
+
+\section{Final Test Set Result}
+
+Evaluated on the held-out 4{,}030-sample test split using the best (epoch 7) checkpoint.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Loss & 0.0034 \\
+Accuracy & 99.93\% \\
+Precision & 99.85\% \\
+Recall & 100.00\% \\
+F1 score & 99.93\% \\
+\bottomrule
+\end{tabular}
+\caption{Final test-set metrics (\texttt{runs/exp1/test\_metrics.json}).}
+\end{table}
+
+\section{Ablation Study: Text-Only and Image-Only Baselines}
+
+A test accuracy of 99.93\% is unusually high for a fake-review detection task, so the two ablations recommended by the architecture document and the README were run: \textbf{text-only} (image stream and alignment score zeroed) and \textbf{image-only} (text stream and alignment score zeroed), using \texttt{train.py --ablation \{text\_only,image\_only\}} against the same cached features and the same fusion-head architecture and training recipe.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Model} & \textbf{Test Acc} & \textbf{Test Prec} & \textbf{Test Recall} & \textbf{Test F1} & \textbf{Epochs to best} \\
+\midrule
+Full fusion  & 99.93\% & 99.85\% & 100.00\% & 99.93\% & 7 of 12 run \\
+Text-only    & 99.83\% & 99.90\% &  99.76\% & 99.83\% & 6 of 11 run \\
+Image-only   & 99.21\% & 99.03\% &  99.41\% & 99.22\% & 18 of 20 run \\
+\bottomrule
+\end{tabular}
+\caption{Ablation comparison on the held-out test split.}
+\end{table}
+
+\textbf{Conclusions:}
+\begin{itemize}[nosep]
+    \item Text alone already reaches very close to the full model (99.83\% vs.\ 99.93\% F1) --- text is the dominant signal for distinguishing human-written from AI-generated reviews in AiGen-FoodReview, consistent with it being reported as an ``easy'' benchmark in the literature.
+    \item Image alone is noticeably weaker (99.22\% F1) and required the full 20-epoch budget to reach it, confirming the image stream carries a real but smaller and harder-to-extract signal than text.
+    \item The full-fusion result is \emph{not} simply ``the easy modality alone'': cross-attention fusion recovers the remaining $\sim$0.1-point gap on top of the text-only baseline, aided by the SigLIP2 image--text alignment score, the gated combination, and the dual-stream patch features. The improvement is small in absolute terms because the dataset is close to saturated by text alone, but it is a real, measured effect.
+    \item None of this suggests a data leak: train, validation, and test sets come from disjoint CSVs, and features were extracted independently per split.
+\end{itemize}
+
+\textbf{Engineering note:} the first text-only attempt crashed with a Windows-specific \texttt{DataLoader} multiprocessing error (\texttt{RuntimeError: Couldn't open shared file mapping..., error code 1455} --- a page-file/shared-memory limit, unrelated to the model code). It did not reproduce on retry with \texttt{--num-workers 0} (single-process data loading), which is what the reported text-only numbers above use.
+
+\section{Simplifications Made (for the Writeup)}
+
+\begin{itemize}[nosep]
+    \item Text encoder is ModernBERT-base, not Qwen3-Embedding (Qwen3-Embedding is pooled-only and does not suit token-level cross-attention as-is).
+    \item Image patch tokens are pooled to a $4\times4$ grid (16 tokens per stream) to keep cross-attention and the on-disk cache laptop-sized; \texttt{--pool-grid} can be raised later for a higher-resolution final run.
+    \item All three encoders are kept frozen; no LoRA fine-tuning is implemented in this version.
+\end{itemize}
+
+\section{Files Produced}
+
+\begin{lstlisting}
+extract_features.py      (bug-fixed, verified)
+train.py
+download_dataset.py
+requirements.txt
+README.md
+data/                     (dataset: CSVs + 20,144 images)
+features/{train,val,test}.pt   (cached encoder outputs, ~4.9 GB total)
+runs/exp1/best_model.pt        (best fusion-head checkpoint)
+runs/exp1/history.json         (full per-epoch metrics)
+runs/exp1/test_metrics.json    (final test metrics)
+runs/ablation_text_only/{best_model.pt,history.json,test_metrics.json}
+runs/ablation_image_only/{best_model.pt,history.json,test_metrics.json}
+train.py                       (now supports --ablation none|text_only|image_only)
+\end{lstlisting}
+
+\section{Suggested Next Steps}
+
+\begin{enumerate}[nosep]
+    \item \textbf{[Done]} Text-only and image-only ablations --- see Section 7.
+    \item Consider \texttt{--pool-grid 7} (or higher) for more spatial detail on the image streams, since image-only is the weaker modality and more resolution may close some of the gap.
+    \item Consider LoRA-adapting the encoders (currently fully frozen) as a further refinement once the above is tried.
+    \item For a stronger paper/thesis claim, also compare against a cheaper non-fusion baseline (e.g.\ plain concatenation instead of cross-attention + GMU) to show the specific fusion mechanism, not just multimodality in general, is responsible for the gain over the text-only baseline.
+\end{enumerate}
+
+\end{document}

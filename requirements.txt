@@ -1,0 +1,14 @@
+transformers>=4.49.0
+accelerate>=0.33.0
+pillow>=10.0.0
+pandas>=2.0.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+tqdm>=4.66.0
+safetensors>=0.4.0
+sentencepiece>=0.2.0
+requests>=2.31.0
+
+# torch is installed separately with the CUDA-enabled wheel (see README.md) --
+# do NOT `pip install -r requirements.txt` for torch itself, the generic
+# PyPI wheel may not match your CUDA driver.
